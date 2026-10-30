@@ -82,80 +82,73 @@ int ObExprAIComplete::calc_result_typeN(ObExprResType &type,
   return ret;
 }
 
-int ObExprAIComplete::eval_ai_complete(const ObExpr &expr, 
+int ObExprAIComplete::eval_ai_complete(const ObExpr &expr,
                                        ObEvalCtx &ctx,
-                                       ObDatum &res) 
+                                       ObDatum &res)
 {
   INIT_SUCC(ret);
   ObDatum *arg_model_id = nullptr;
   ObDatum *arg_prompt = nullptr;
   ObDatum *arg_config = nullptr;
-  if (OB_FAIL(expr.eval_param_value(ctx, arg_model_id, arg_prompt, arg_config))) {
+  if (expr.arg_cnt_ == 3
+      ? OB_FAIL(expr.eval_param_value(ctx, arg_model_id, arg_prompt, arg_config))
+      : OB_FAIL(expr.eval_param_value(ctx, arg_model_id, arg_prompt))) {
   } else if (arg_model_id->is_null() || arg_prompt->is_null()) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, parameters is null");
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, parameters are null");
     res.set_null();
   } else {
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
-    
-    MultimodeAlloctor temp_allocator(tmp_alloc_g.get_allocator());
+    MultimodeAlloctor allocator(tmp_alloc_g.get_allocator());
     lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr(N_AI_COMPLETE));
     ObAIFuncExprInfo *info = nullptr;
     ObString model_id = arg_model_id->get_string();
     ObString prompt;
     ObJsonObject *config = nullptr;
-    ObString config_str;
-    share::ObAiModelEndpointInfo resolved_endpoint;
-    const share::ObAiModelEndpointInfo *endpoint_info = &resolved_endpoint;
+    share::ObAiModelEndpointInfo endpoint_info;
     query::ObIAiEndpointResolver *endpoint_resolver =
         ::oceanbase::share::server_service<::oceanbase::query::ObIAiEndpointResolver>();
-    ObExpr *arg_expr_prompt = expr.args_[1];
-    if ( OB_ISNULL(arg_expr_prompt) ) {
-      ret = OB_ERR_UNEXPECTED;
-    } else if (arg_expr_prompt->datum_meta_.type_ == ObJsonType) {
+    if (expr.args_[PROMPT_IDX]->datum_meta_.type_ == ObJsonType) {
       ObIJsonBase *j_base = nullptr;
-      ObJsonObject *prompt_object = nullptr;
       bool is_null = false;
-      if (OB_FAIL(ObJsonExprHelper::get_json_doc(expr, ctx, temp_allocator, PROMPT_IDX, j_base, is_null))) {
-      } else if (j_base->json_type() != ObJsonNodeType::J_OBJECT) {
+      if (OB_FAIL(ObJsonExprHelper::get_json_doc(expr, ctx, allocator, PROMPT_IDX, j_base, is_null))) {
+      } else if (is_null || OB_ISNULL(j_base) || j_base->json_type() != ObJsonNodeType::J_OBJECT) {
         ret = OB_INVALID_ARGUMENT;
-      } else if (OB_FALSE_IT(prompt_object = static_cast<ObJsonObject *>(j_base))) {
-      } else if (!ObAIFuncPromptObjectUtils::is_valid_prompt_object(prompt_object)) {
+      } else if (OB_FAIL(ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(
+                          allocator, static_cast<ObJsonObject *>(j_base), prompt))) {
+      }
+    } else if (OB_FAIL(ObTextStringHelper::read_real_string_data(ctx.exec_ctx_, allocator,
+                       *arg_prompt, expr.args_[PROMPT_IDX]->datum_meta_,
+                       expr.args_[PROMPT_IDX]->obj_meta_.has_lob_header(), prompt))) {
+    }
+    // get_json_doc understands both JSON's binary representation and TEXT LOBs.
+    // SQL NULL is the same as omitting the optional configuration argument.
+    if (OB_SUCC(ret) && OB_NOT_NULL(arg_config) && !arg_config->is_null()) {
+      ObIJsonBase *config_base = nullptr;
+      bool is_null = false;
+      if (OB_FAIL(ObJsonExprHelper::get_json_doc(expr, ctx, allocator, CONFIG_IDX, config_base, is_null))) {
+      } else if (is_null || OB_ISNULL(config_base)
+          || config_base->json_type() != ObJsonNodeType::J_OBJECT) {
         ret = OB_INVALID_ARGUMENT;
-        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "prompt is not valid");
-        res.set_null();
-      } else if (!ObAIFuncJsonUtils::ob_is_json_array_all_str(static_cast<ObJsonArray *>(prompt_object->get_value(ObAIFuncPromptObjectUtils::prompt_args_key)))) {
-        ret = OB_NOT_SUPPORTED;
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, "prompt object is not support");
-      } else if (OB_FAIL(ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(temp_allocator, prompt_object, prompt))) {
-      }
-    } else if (OB_FAIL(ObTextStringHelper::read_real_string_data(ctx.exec_ctx_, temp_allocator, *arg_prompt, expr.args_[1]->datum_meta_, expr.args_[1]->obj_meta_.has_lob_header(), prompt))) {
-    }
-
-    if (OB_FAIL(ret)) {
-    } else if (OB_NOT_NULL(arg_config)) {
-      if (OB_FAIL(ObTextStringHelper::read_real_string_data(ctx.exec_ctx_, temp_allocator, *arg_config, expr.args_[2]->datum_meta_, expr.args_[2]->obj_meta_.has_lob_header(), config_str))) {
-      } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_object_form_str(temp_allocator, config_str, config))) {
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, config must be a JSON object");
+      } else {
+        config = static_cast<ObJsonObject *>(config_base);
       }
     }
-
     if (OB_FAIL(ret)) {
     } else if (model_id.empty() || prompt.empty()) {
       ret = OB_INVALID_ARGUMENT;
       LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, model id or input is empty");
-      res.set_null();
-    }
-
-    if (OB_FAIL(ret)){
-    } else if (OB_FAIL(ObAIFuncUtils::get_ai_func_info(temp_allocator, model_id, info))) {
+    } else if (OB_FAIL(ObAIFuncUtils::get_ai_func_info(allocator, model_id, info))) {
     } else if (OB_ISNULL(endpoint_resolver)) {
       ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(endpoint_resolver->resolve_by_model_name(
-                   model_id, temp_allocator, resolved_endpoint))) {
+    } else if (OB_FAIL(endpoint_resolver->resolve_by_model_name(model_id, allocator, endpoint_info))) {
     } else {
-      ObAIFuncModel model(temp_allocator, *info, *endpoint_info);
+      ObAIFuncModel model(allocator, *info, endpoint_info);
       ObString result;
       if (OB_FAIL(model.call_completion(prompt, config, result))) {
+      } else if (result.empty()) {
+        ret = OB_INVALID_DATA;
       } else if (OB_FAIL(ObAIFuncUtils::set_string_result(expr, ctx, res, result))) {
       }
     }
